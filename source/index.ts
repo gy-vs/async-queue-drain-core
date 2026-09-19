@@ -10,6 +10,29 @@ type Task<TaskResultType> =
 
 type EventName = 'active' | 'idle' | 'empty' | 'add' | 'next' | 'completed' | 'error';
 
+// Whether a pump is filling concurrency (new tasks/resume/window) or
+// performing the single follow-up attempt of a settling job (`#next()`).
+type PumpMode = 'fill' | 'run';
+
+// Number of jobs a single `#processQueue()` run starts before yielding to the
+// event loop. Prevents draining very large backlogs (for example, thousands of
+// already-aborted jobs) from blocking timers and I/O.
+const processQueueSliceSize = 1000;
+
+const scheduleMacrotask: (callback: () => void) => (() => void) = (typeof globalThis.setImmediate === 'function')
+	? callback => {
+		const handle = globalThis.setImmediate(callback);
+		return () => {
+			globalThis.clearImmediate(handle);
+		};
+	}
+	: callback => {
+		const handle = globalThis.setTimeout(callback, 0);
+		return () => {
+			globalThis.clearTimeout(handle);
+		};
+	};
+
 /**
 Promise queue with concurrency control.
 */
@@ -37,6 +60,28 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 	readonly #queueClass: new () => QueueType;
 
 	#pending = 0;
+
+	// Guards against re-entrant scheduling. When a job settles synchronously
+	// (for example, an already-aborted job), its completion path asks the queue
+	// to keep going; while a pump is in progress that request only flips
+	// `#needsPump`, and the running loop performs another iteration instead of
+	// recursing and growing the call stack.
+	#processing = false;
+
+	// Set by `#next()`/a nested pump while a drain is active, indicating that a
+	// job settled synchronously (such as an already-aborted job) and freed a
+	// slot. The drain's follow-up loop consumes the flag and performs the next
+	// start attempt iteratively instead of recursing.
+	#needsPump = false;
+
+	// Set while a slice continuation is scheduled but has not run yet.
+	#processingScheduled = false;
+
+	// Pump mode the scheduled continuation resumes with.
+	#scheduledPumpMode: PumpMode = 'fill';
+
+	// Cancels the scheduled slice continuation, if one is pending.
+	#cancelScheduledProcessing?: () => void;
 
 	// The `!` is needed because of https://github.com/microsoft/TypeScript/issues/32194
 	#concurrency!: number;
@@ -100,7 +145,18 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 
 	#next(): void {
 		this.#pending--;
-		this.#tryToStartAnother();
+
+		if (this.#processing) {
+			// A drain is active: ask its follow-up chain to handle the freed
+			// slot instead of recursing into another pump.
+			this.#needsPump = true;
+		} else {
+			// `#next()` performs exactly one follow-up attempt (plus any
+			// synchronous settlement chain it starts), matching the original
+			// recursive behavior.
+			this.#processQueue('run');
+		}
+
 		this.emit('next');
 	}
 
@@ -229,12 +285,147 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 		this.#processQueue();
 	}
 
+	#scheduleProcessQueue(mode: PumpMode): void {
+		if (this.#processingScheduled) {
+			return;
+		}
+
+		this.#processingScheduled = true;
+		this.#scheduledPumpMode = mode;
+
+		this.#cancelScheduledProcessing = scheduleMacrotask(() => {
+			this.#processingScheduled = false;
+			this.#cancelScheduledProcessing = undefined;
+
+			// The queue may have drained by the time the turn arrives (for
+			// example, the slice filled concurrency with long-running jobs and
+			// the queued jobs were started by another pump). In that case there
+			// is nothing to do; `empty`/`idle` were already emitted and must not
+			// be emitted again.
+			if (this.#queue.size === 0) {
+				return;
+			}
+
+			this.#processQueue(this.#scheduledPumpMode ?? 'fill');
+		});
+	}
+
 	/**
-	Executes all queued functions until it reaches the limit.
+	Starts queued jobs.
+
+	- In `'fill'` mode (adding tasks, resuming, interval window opening), jobs
+	  are started repeatedly until the concurrency and interval limits are
+	  reached.
+	- In `'run'` mode (a job's `#next()`), exactly one follow-up attempt is
+	  made for the slot that just freed.
+
+	A job that settles synchronously during an attempt (notably an already-aborted
+	job) normally chains another `#next()`/pump recursively; long chains of
+	those (thousands of shared-signal cancellations) previously overflowed the
+	call stack. Such chains are instead advanced iteratively in
+	`#drainFollowups()`, while still running within the settling job's
+	`#next()` frame so `next`/`empty` event ordering is preserved. Drains longer
+	than `processQueueSliceSize` started jobs are split across event-loop turns
+	so timers and I/O are not starved.
 	*/
-	#processQueue(): void {
-		// eslint-disable-next-line no-empty
-		while (this.#tryToStartAnother()) {}
+	#processQueue(mode: PumpMode = 'fill'): void {
+		// Re-entrant calls from jobs settling while a drain is active only ask
+		// the running drain for another follow-up attempt.
+		if (this.#processing) {
+			this.#needsPump = true;
+			return;
+		}
+
+		// Something made the queue runnable before a scheduled slice
+		// continuation fired (a job completed, a window opened, the queue
+		// resumed): adopt it and drain now instead of waiting.
+		if (this.#processingScheduled) {
+			mode = this.#scheduledPumpMode ?? mode;
+			this.#cancelScheduledProcessing!();
+			this.#processingScheduled = false;
+			this.#cancelScheduledProcessing = undefined;
+		}
+
+		this.#processing = true;
+
+		try {
+			let startedInSlice = 0;
+
+			// eslint-disable-next-line no-constant-condition
+			while (true) {
+				this.#needsPump = false;
+
+				if (!this.#tryToStartAnother()) {
+					// Empty queue, paused, or at the concurrency/interval limit.
+					break;
+				}
+
+				startedInSlice++;
+
+				// Advance through any chain of jobs freed by synchronous
+				// settlements (aborted jobs) iteratively, inside the settling
+				// job's `#next()` frame.
+				startedInSlice = this.#drainFollowups(startedInSlice);
+
+				if (this.#processingScheduled) {
+					return;
+				}
+
+				if (mode === 'run') {
+					// One follow-up attempt per `#next()` (the chain above
+					// accounts for the synchronously settled jobs it started).
+					return;
+				}
+
+				if (startedInSlice >= processQueueSliceSize && this.#queue.size > 0 && !this.#doesConcurrentAllowAnother) {
+					// Event-loop budget spent while queued jobs are still waiting
+					// for a slot. Continue on a fresh stack on the next
+					// event-loop turn so timers and I/O are not starved. If a
+					// slot frees in the meantime, `#next()` adopts the scheduled
+					// continuation and resumes immediately.
+					this.#scheduleProcessQueue('fill');
+					return;
+				}
+			}
+		} finally {
+			this.#needsPump = false;
+			this.#processing = false;
+		}
+	}
+
+	/**
+	Performs the follow-up start attempts caused by jobs settling
+	synchronously while a drain is active.
+
+	A settled job sets `#needsPump` from its `#next()`; this loop realizes each
+	such follow-up attempt on the same stack instead of recursing one frame per
+	job, keeping the call stack bounded even for thousands of chained
+	cancellations. Returns the updated number of started jobs in the slice, and
+	schedules a continuation when the event-loop budget is spent.
+	*/
+	#drainFollowups(startedInSlice: number): number {
+		let count = startedInSlice;
+
+		while (this.#needsPump) {
+			this.#needsPump = false;
+
+			if (!this.#tryToStartAnother()) {
+				// Empty queue, paused, or at the concurrency/interval limit. The
+				// attempt is attributed to the settling job's `#next()`.
+				return count;
+			}
+
+			count++;
+
+			if (count >= processQueueSliceSize && this.#queue.size > 0 && !this.#doesConcurrentAllowAnother) {
+				// Continue draining on a fresh stack; resume in run mode so each
+				// settlement still owns a single follow-up attempt.
+				this.#scheduleProcessQueue('run');
+				return count;
+			}
+		}
+
+		return count;
 	}
 
 	get concurrency(): number {

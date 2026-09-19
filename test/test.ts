@@ -1654,3 +1654,322 @@ test('intervalCap should be respected with high concurrency (issue #126)', async
 	// Check that tasks actually completed (basic sanity check)
 	t.is(results.length, 5000, 'All tasks should complete');
 });
+
+// Regression test for the call-stack overflow that happened when thousands of
+// jobs sharing an AbortSignal were enqueued (concurrency limited) and the
+// signal was aborted: each aborted job chained the next start from its
+// `#next()`, nesting the whole run on a single stack.
+test('mass abort does not overflow the stack and drains the queue', async t => {
+	const queue = new PQueue({concurrency: 1});
+	const controller = new AbortController();
+
+	const count = 10_000;
+	const promises = [];
+	for (let index = 0; index < count; index++) {
+		promises.push(queue.add(async () => new Promise(() => {}), {signal: controller.signal})); // eslint-disable-line @typescript-eslint/no-empty-function
+	}
+
+	controller.abort();
+
+	const results = await Promise.allSettled(promises);
+	t.is(results.filter(result => result.status === 'rejected').length, count);
+	t.is(queue.size, 0);
+	t.is(queue.pending, 0);
+});
+
+test('mass abort does not overflow with higher concurrency either', async t => {
+	for (const concurrency of [2, 8, 64]) {
+		const queue = new PQueue({concurrency});
+		const controller = new AbortController();
+
+		const count = 5000;
+		const promises = [];
+		for (let index = 0; index < count; index++) {
+			promises.push(queue.add(async () => new Promise(() => {}), {signal: controller.signal})); // eslint-disable-line @typescript-eslint/no-empty-function
+		}
+
+		controller.abort();
+
+		// eslint-disable-next-line no-await-in-loop
+		const results = await Promise.allSettled(promises);
+		t.is(results.filter(result => result.status === 'rejected').length, count, `concurrency ${concurrency}`);
+		t.is(queue.size, 0, `concurrency ${concurrency}`);
+		t.is(queue.pending, 0, `concurrency ${concurrency}`);
+	}
+});
+
+// Cancelled jobs are skipped, but runnable jobs interspersed between them must
+// still run, in queue order, and their promises must resolve normally.
+test('mass abort with runnable jobs interspersed', async t => {
+	const queue = new PQueue({concurrency: 1});
+	const controller = new AbortController();
+
+	const count = 6000;
+	const promises = [];
+	const runnableIndexes = new Set<number>();
+	const ran: number[] = [];
+
+	for (let index = 0; index < count; index++) {
+		// Every 250th job is runnable and does not use the shared signal.
+		const isRunnable = index % 250 === 0;
+		if (isRunnable) {
+			runnableIndexes.add(index);
+		}
+
+		promises.push(queue.add(
+			async () => {
+				if (isRunnable) {
+					ran.push(index);
+					return index;
+				}
+
+				// eslint-disable-next-line @typescript-eslint/no-empty-function
+				return new Promise(() => {});
+			},
+			isRunnable ? undefined : {signal: controller.signal},
+		));
+	}
+
+	controller.abort();
+
+	const results = await Promise.allSettled(promises);
+
+	const rejected = results
+		.map((result, index) => ({result, index}))
+		.filter(({result}) => result.status === 'rejected');
+	const fulfilled = results.filter(result => result.status === 'fulfilled');
+
+	t.is(rejected.length, count - runnableIndexes.size);
+	t.is(fulfilled.length, runnableIndexes.size);
+	t.is(ran.length, runnableIndexes.size);
+
+	// Runnable jobs must execute in queue order even though they are surrounded
+	// by jobs that are skipped.
+	t.deepEqual(ran, [...runnableIndexes]);
+
+	t.is(queue.size, 0);
+	t.is(queue.pending, 0);
+});
+
+// Priority must still be honored while skipping cancelled jobs.
+test('mass abort preserves priority order among runnable jobs', async t => {
+	const queue = new PQueue({concurrency: 1});
+	const controller = new AbortController();
+
+	const count = 3000;
+	const promises = [];
+	const labels: string[] = [];
+	const order: string[] = [];
+
+	// All cancelled jobs use the shared signal. Runnable jobs get descending
+	// priority (so the first added runnable has the highest priority), while the
+	// cancelled jobs sit at priority 0.
+	for (let index = 0; index < count; index++) {
+		const isRunnable = index % 500 === 0;
+		const label = `r${index}`;
+
+		if (isRunnable) {
+			labels.push(label);
+		}
+
+		promises.push(queue.add(
+			async () => {
+				if (isRunnable) {
+					order.push(label);
+					return index;
+				}
+
+				// eslint-disable-next-line @typescript-eslint/no-empty-function
+				return new Promise(() => {});
+			},
+			{
+				priority: isRunnable ? count - index : 0,
+				signal: isRunnable ? undefined : controller.signal,
+			},
+		));
+	}
+
+	controller.abort();
+
+	await Promise.allSettled(promises);
+
+	// Runnable jobs were enqueued in ascending index order but given descending
+	// priority, so they must run in the same order they were enqueued.
+	t.deepEqual(order, labels);
+	t.is(queue.size, 0);
+	t.is(queue.pending, 0);
+});
+
+// Pausing must stop the drain; resuming after abort must finish skipping the
+// cancelled jobs and settle every promise.
+test('mass abort drains after pause then resume', async t => {
+	const queue = new PQueue({concurrency: 2, autoStart: false});
+	const controller = new AbortController();
+
+	const count = 5000;
+	const promises = [];
+	for (let index = 0; index < count; index++) {
+		promises.push(queue.add(async () => new Promise(() => {}), {signal: controller.signal})); // eslint-disable-line @typescript-eslint/no-empty-function
+	}
+
+	// Abort while paused: nothing has run yet, so all jobs are still queued.
+	controller.abort();
+	t.is(queue.pending, 0);
+	t.is(queue.size, count);
+
+	queue.start();
+
+	const results = await Promise.allSettled(promises);
+	t.is(results.filter(result => result.status === 'rejected').length, count);
+	t.is(queue.size, 0);
+	t.is(queue.pending, 0);
+});
+
+// Pause partway through a drain, then resume: the queued runnable job stays
+// queued while paused and runs after resume.
+test('mass abort paused mid-drain and resumed', async t => {
+	const queue = new PQueue({concurrency: 1});
+	const controller = new AbortController();
+
+	const count = 5000;
+	const promises = [];
+	let runnableRan = false;
+
+	// A runnable (non-aborted) job partway through the chain parks until the
+	// test pauses and then resumes the queue, giving a deterministic pause point
+	// while cancelled jobs remain queued on both sides of it.
+	const gate = pDefer();
+	const gateIndex = Math.floor(count / 2);
+	const runnableIndex = count - 1;
+	const runnableTask = async () => {
+		runnableRan = true;
+		return 'done';
+	};
+
+	// eslint-disable-next-line @typescript-eslint/no-empty-function
+	const cancelledTask = async () => new Promise(() => {});
+
+	for (let index = 0; index < count; index++) {
+		if (index === gateIndex) {
+			promises.push(queue.add(async () => gate.promise));
+		} else if (index === runnableIndex) {
+			promises.push(queue.add(runnableTask));
+		} else {
+			promises.push(queue.add(cancelledTask, {signal: controller.signal}));
+		}
+	}
+
+	// Drain until the gate job is running and cancelled jobs still queue behind.
+	controller.abort();
+	await delay(30);
+	t.is(queue.pending, 1);
+	t.true(queue.size > 0);
+
+	queue.pause();
+	t.is(queue.isPaused, true);
+	t.false(runnableRan);
+
+	// Releasing the gate while paused must not advance the queue.
+	gate.resolve();
+	await delay(20);
+	t.false(runnableRan);
+	t.true(queue.size > 0);
+
+	queue.start();
+
+	await Promise.allSettled(promises);
+	t.true(runnableRan);
+	t.is(queue.size, 0);
+	t.is(queue.pending, 0);
+});
+
+// Under an intervalCap, skipped (cancelled) jobs must not consume the cap, so a
+// runnable job queued behind thousands of cancelled jobs runs in the first
+// available window and the queue drains completely.
+test('mass abort under an interval window does not consume intervalCap', async t => {
+	const queue = new PQueue({concurrency: 1, intervalCap: 1, interval: 50});
+	const controller = new AbortController();
+
+	const count = 5000;
+	const promises = [];
+	let runnableRan = false;
+
+	const runnableTask = async () => {
+		runnableRan = true;
+		return 'done';
+	};
+
+	// eslint-disable-next-line @typescript-eslint/no-empty-function
+	const cancelledTask = async () => new Promise(() => {});
+
+	for (let index = 0; index < count; index++) {
+		if (index === count - 1) {
+			promises.push(queue.add(runnableTask));
+		} else {
+			promises.push(queue.add(cancelledTask, {signal: controller.signal}));
+		}
+	}
+
+	const end = timeSpan();
+	controller.abort();
+
+	await Promise.allSettled(promises);
+
+	// Cancelled jobs decrement the interval count as they are skipped, so the
+	// runnable job starts in a single window rather than waiting through
+	// thousands of interval ticks.
+	t.true(runnableRan);
+	t.true(end() < 400, `drain took too long: ${end()}ms`);
+	t.is(queue.size, 0);
+	t.is(queue.pending, 0);
+});
+
+// Draining a very large backlog must yield to the event loop between slices so
+// timers and I/O are not starved.
+test('mass abort yields to the event loop while draining', async t => {
+	const queue = new PQueue({concurrency: 1});
+	const controller = new AbortController();
+
+	const count = 10_000;
+	const promises = [];
+	const sizesObservedOnEventLoopTurns: number[] = [];
+
+	for (let index = 0; index < count; index++) {
+		// Two runnable markers placed beyond slice boundaries. Each records the
+		// current queue size on an immediate event-loop task and then aborts
+		// itself, allowing the drain to continue.
+		const isMarker = index === 2500 || index === 7500;
+
+		if (isMarker) {
+			const markerController = new AbortController();
+
+			promises.push(queue.add(async ({signal}) => {
+				setImmediate(() => {
+					sizesObservedOnEventLoopTurns.push(queue.size);
+					markerController.abort();
+				});
+
+				await new Promise((_resolve, reject) => {
+					signal!.addEventListener('abort', () => {
+						reject(signal!.reason);
+					}, {once: true});
+				});
+			}, {signal: markerController.signal}));
+		} else {
+			promises.push(queue.add(async () => new Promise(() => {}), {signal: controller.signal})); // eslint-disable-line @typescript-eslint/no-empty-function
+		}
+	}
+
+	controller.abort();
+
+	await Promise.allSettled(promises);
+
+	// Both markers ran on their own event-loop turns while cancelled jobs were
+	// still queued behind them. A fully synchronous drain would never let these
+	// tasks run mid-drain.
+	t.is(sizesObservedOnEventLoopTurns.length, 2);
+	t.true(sizesObservedOnEventLoopTurns.every(size => size > 0), 'event loop should run between slices while jobs are queued');
+
+	t.is(queue.size, 0);
+	t.is(queue.pending, 0);
+});
