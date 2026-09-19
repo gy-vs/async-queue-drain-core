@@ -11,6 +11,13 @@ type Task<TaskResultType> =
 type EventName = 'active' | 'idle' | 'empty' | 'add' | 'next' | 'completed' | 'error';
 
 /**
+How many tasks may be started in a single synchronous scheduling pass before the remaining work is deferred to a microtask.
+
+Skipping an unrunnable task (for example, one whose signal is already aborted) schedules the next task synchronously. Bounding each pass keeps a large run of such tasks from monopolizing the event loop, while still draining iteratively with a bounded call stack.
+*/
+const synchronousSchedulingBatchSize = 1000;
+
+/**
 Promise queue with concurrency control.
 */
 export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsType> = PriorityQueue, EnqueueOptionsType extends QueueAddOptions = QueueAddOptions> extends EventEmitter<EventName> { // eslint-disable-line @typescript-eslint/naming-convention, unicorn/prefer-event-target
@@ -42,6 +49,15 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 	#concurrency!: number;
 
 	#isPaused: boolean;
+
+	// `true` while a scheduling pass is on the stack. A task that settles
+	// synchronously (for example, an aborted task) requests scheduling
+	// re-entrantly; the request is then handled iteratively by the outermost
+	// call instead of recursing.
+	#isProcessingQueue = false;
+
+	// Set when scheduling is requested while `#isProcessingQueue` is `true`.
+	#shouldProcessQueueAgain = false;
 
 	readonly #throwOnTimeout: boolean;
 
@@ -165,6 +181,44 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 	}
 
 	#tryToStartAnother(): boolean {
+		// Scheduling is requested re-entrantly when a task settles synchronously
+		// while the queue is already being processed (for example, a task whose
+		// signal is already aborted). Defer to the outermost call so that any
+		// number of unrunnable tasks is skipped iteratively, with a bounded
+		// call stack, instead of recursing once per skipped task.
+		if (this.#isProcessingQueue) {
+			this.#shouldProcessQueueAgain = true;
+			return false;
+		}
+
+		this.#isProcessingQueue = true;
+
+		try {
+			let remainingSkips = synchronousSchedulingBatchSize;
+			let startedAnother = false;
+
+			do {
+				this.#shouldProcessQueueAgain = false;
+				startedAnother = this.#startAnotherIfPossible();
+
+				if (this.#shouldProcessQueueAgain && --remainingSkips === 0) {
+					// Continue in a microtask so that a long run of skipped tasks
+					// does not monopolize the event loop.
+					queueMicrotask(() => {
+						this.#tryToStartAnother();
+					});
+
+					return false;
+				}
+			} while (this.#shouldProcessQueueAgain);
+
+			return startedAnother;
+		} finally {
+			this.#isProcessingQueue = false;
+		}
+	}
+
+	#startAnotherIfPossible(): boolean {
 		if (this.#queue.size === 0) {
 			// We can clear the interval ("pause")
 			// Because we can redo it later ("resume")

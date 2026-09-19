@@ -1211,6 +1211,240 @@ test('pending promises with abortions counted fast enough', async t => {
 	t.true(hasThirdRun);
 });
 
+test('skipping many aborted tasks does not overflow the call stack', async t => {
+	const taskCount = 10_000;
+	const queue = new PQueue({concurrency: 1});
+	const controller = new AbortController();
+
+	let activeEvents = 0;
+	let nextEvents = 0;
+	let errorEvents = 0;
+	let emptyEvents = 0;
+	let idleEvents = 0;
+	queue.on('active', () => {
+		activeEvents++;
+	});
+	queue.on('next', () => {
+		nextEvents++;
+	});
+	queue.on('error', () => {
+		errorEvents++;
+	});
+	queue.on('empty', () => {
+		emptyEvents++;
+	});
+	queue.on('idle', () => {
+		idleEvents++;
+	});
+
+	// Keep the single concurrency slot busy so the aborted tasks pile up in the queue.
+	const blocker = queue.add(async () => delay(50));
+
+	const promises: Array<Promise<unknown>> = [];
+	for (let index = 0; index < taskCount; index++) {
+		promises.push(queue.add(() => {}, {signal: controller.signal})); // eslint-disable-line @typescript-eslint/no-empty-function
+	}
+
+	const settled = Promise.allSettled(promises);
+	controller.abort();
+
+	const results = await settled;
+	t.true(results.every(result => result.status === 'rejected' && result.reason instanceof DOMException));
+
+	await blocker;
+	await queue.onIdle();
+
+	t.like(queue, {size: 0, pending: 0});
+	t.is(activeEvents, taskCount + 1);
+	t.is(errorEvents, taskCount);
+	t.is(nextEvents, taskCount + 1);
+	t.is(emptyEvents, 1);
+	t.is(idleEvents, 1);
+});
+
+test('runnable tasks interleaved with many aborted tasks run in order', async t => {
+	const queue = new PQueue({concurrency: 1});
+	const controller = new AbortController();
+
+	const blocker = queue.add(async () => delay(30));
+
+	const taskCount = 4000;
+	const expectedOrder: number[] = [];
+	const executionOrder: number[] = [];
+	const promises: Array<Promise<unknown>> = [blocker];
+
+	for (let index = 0; index < taskCount; index++) {
+		if (index % 4 === 0) {
+			const value = index;
+			expectedOrder.push(value);
+			promises.push(queue.add(async () => {
+				executionOrder.push(value);
+				return value;
+			}));
+		} else {
+			promises.push(queue.add(() => {}, {signal: controller.signal})); // eslint-disable-line @typescript-eslint/no-empty-function
+		}
+	}
+
+	const settled = Promise.allSettled(promises);
+	controller.abort();
+
+	const results = await settled;
+
+	// Every runnable task resolves with its value, in FIFO order, despite the
+	// aborted tasks skipped between them.
+	t.deepEqual(executionOrder, expectedOrder);
+	t.is(results.filter(result => result.status === 'fulfilled').length, expectedOrder.length + 1);
+	t.is(results.filter(result => result.status === 'rejected').length, taskCount - expectedOrder.length);
+
+	await queue.onIdle();
+	t.like(queue, {size: 0, pending: 0});
+});
+
+test('priority is preserved when skipping many aborted tasks', async t => {
+	const queue = new PQueue({concurrency: 1});
+	const controller = new AbortController();
+
+	const blocker = queue.add(async () => delay(30));
+
+	const promises: Array<Promise<unknown>> = [blocker];
+	for (let index = 0; index < 3000; index++) {
+		promises.push(queue.add(() => {}, {signal: controller.signal})); // eslint-disable-line @typescript-eslint/no-empty-function
+	}
+
+	const executionOrder: number[] = [];
+	for (const priority of [2, 5, 1, 4, 3]) {
+		promises.push(queue.add(async () => {
+			executionOrder.push(priority);
+		}, {priority}));
+	}
+
+	const settled = Promise.allSettled(promises);
+	controller.abort();
+
+	const results = await settled;
+
+	t.deepEqual(executionOrder, [5, 4, 3, 2, 1]);
+	t.is(results.filter(result => result.status === 'rejected').length, 3000);
+
+	await queue.onIdle();
+	t.like(queue, {size: 0, pending: 0});
+});
+
+test('paused queue skips a large batch of aborted tasks in bounded chunks', async t => {
+	const taskCount = 2500;
+	const queue = new PQueue({concurrency: 1, autoStart: false});
+	const controller = new AbortController();
+
+	const promises: Array<Promise<unknown>> = [];
+	for (let index = 0; index < taskCount; index++) {
+		promises.push(queue.add(() => {}, {signal: controller.signal})); // eslint-disable-line @typescript-eslint/no-empty-function
+	}
+
+	const settled = Promise.allSettled(promises);
+	controller.abort();
+
+	t.is(queue.size, taskCount);
+	t.is(queue.pending, 0);
+
+	// Only a bounded chunk is skipped synchronously; the rest is deferred to
+	// microtasks so the event loop is not monopolized.
+	queue.start();
+	t.true(queue.size > 0, 'draining must not happen in a single synchronous pass');
+	t.true(queue.size < taskCount, 'a chunk of tasks should have been skipped synchronously');
+
+	// Pausing stops the deferred continuation from skipping more tasks.
+	queue.pause();
+	const sizeWhenPaused = queue.size;
+	await delay(20);
+	t.is(queue.size, sizeWhenPaused);
+	t.is(queue.pending, 0);
+
+	queue.start();
+	const results = await settled;
+	t.true(results.every(result => result.status === 'rejected' && result.reason instanceof DOMException));
+
+	await queue.onIdle();
+	t.like(queue, {size: 0, pending: 0});
+});
+
+test('many aborted tasks do not consume interval capacity and rate limiting is preserved', async t => {
+	const queue = new PQueue({
+		concurrency: 1,
+		interval: 100,
+		intervalCap: 1,
+	});
+	const controller = new AbortController();
+
+	const end = timeSpan();
+	const executionOrder: number[] = [];
+	const promises: Array<Promise<unknown>> = [];
+
+	for (let index = 0; index < 2000; index++) {
+		if (index % 500 === 0) {
+			const value = index;
+			promises.push(queue.add(async () => {
+				executionOrder.push(value);
+			}));
+		} else {
+			promises.push(queue.add(() => {}, {signal: controller.signal})); // eslint-disable-line @typescript-eslint/no-empty-function
+		}
+	}
+
+	const settled = Promise.allSettled(promises);
+	controller.abort();
+
+	const results = await settled;
+
+	// Four runnable tasks, at most one per interval window, in FIFO order.
+	t.deepEqual(executionOrder, [0, 500, 1000, 1500]);
+	t.true(end() >= 300, `rate limit not respected, completed in ${end()}ms`);
+	t.is(results.filter(result => result.status === 'rejected').length, 2000 - 4);
+
+	await queue.onIdle();
+	t.like(queue, {size: 0, pending: 0});
+});
+
+test('events are emitted in per-task order when skipping aborted tasks', async t => {
+	const queue = new PQueue({concurrency: 1});
+	const controller = new AbortController();
+
+	const events: string[] = [];
+	queue.on('active', () => {
+		events.push('active');
+	});
+	queue.on('error', () => {
+		events.push('error');
+	});
+	queue.on('next', () => {
+		events.push('next');
+	});
+	queue.on('empty', () => {
+		events.push('empty');
+	});
+	queue.on('idle', () => {
+		events.push('idle');
+	});
+
+	const blocker = queue.add(async () => delay(20));
+	const promises: Array<Promise<unknown>> = [blocker];
+	for (let index = 0; index < 5; index++) {
+		promises.push(queue.add(() => {}, {signal: controller.signal})); // eslint-disable-line @typescript-eslint/no-empty-function
+	}
+
+	const settled = Promise.allSettled(promises);
+	controller.abort();
+	await settled;
+
+	t.deepEqual(events, [
+		'active',
+		...Array.from({length: 5}, () => ['active', 'error', 'next']).flat(),
+		'empty',
+		'idle',
+		'next',
+	]);
+});
+
 test('intervalCap', async t => {
 	const queue = new PQueue({
 		interval: 1000,
